@@ -227,6 +227,9 @@ func (m *mockChunkStore) Stop() {}
 func (m *mockChunkStore) Get(ctx context.Context, userID string, from, through model.Time, matchers ...*labels.Matcher) ([]chunk.Chunk, error) {
 	return nil, nil
 }
+func (m *mockChunkStore) GetChunkFetcher(_ model.Time) *chunk.Fetcher {
+	return nil
+}
 
 func (m *mockChunkStore) GetChunkFetcher(_ model.Time) *fetcher.Fetcher {
 	return nil

@@ -345,34 +345,31 @@ func (t *Loki) initQuerier() (services.Service, error) {
 		return nil, err
 	}
 
-	if t.Cfg.Querier.MultiTenantQueriesEnabled {
-		t.Querier = querier.NewMultiTenantQuerier(q, util_log.Logger)
-		tenant.WithDefaultResolver(tenant.NewMultiResolver())
+	// Alteration based on if we are running multitenancy in label mode, we require different handler for queries
+	// as client has to specify the orgID for searching
+	var httpMiddleware middleware.Interface
+	if t.cfg.MultiTenancy.Enabled && t.cfg.MultiTenancy.Type == "label" {
+		httpMiddleware = middleware.Merge(
+			serverutil.RecoveryHTTPMiddleware,
+			t.httpAuthMiddlewareQuery,
+			serverutil.NewPrepopulateMiddleware(),
+		)
 	} else {
-		t.Querier = q
-	}
-
-	querierWorkerServiceConfig := querier.WorkerServiceConfig{
-		AllEnabled:            t.Cfg.isModuleEnabled(All),
-		ReadEnabled:           t.Cfg.isModuleEnabled(Read),
-		GrpcListenAddress:     t.Cfg.Server.GRPCListenAddress,
-		GrpcListenPort:        t.Cfg.Server.GRPCListenPort,
-		QuerierMaxConcurrent:  t.Cfg.Querier.MaxConcurrent,
-		QuerierWorkerConfig:   &t.Cfg.Worker,
-		QueryFrontendEnabled:  t.Cfg.isModuleEnabled(QueryFrontend),
-		QuerySchedulerEnabled: t.Cfg.isModuleEnabled(QueryScheduler),
-		SchedulerRing:         scheduler.SafeReadRing(t.queryScheduler),
-	}
-
-	toMerge := []middleware.Interface{
-		httpreq.ExtractQueryMetricsMiddleware(),
-	}
-	if t.supportIndexDeleteRequest() && t.Cfg.CompactorConfig.RetentionEnabled {
-		toMerge = append(
-			toMerge,
-			queryrangebase.CacheGenNumberHeaderSetterMiddleware(t.cacheGenerationLoader),
+		httpMiddleware = middleware.Merge(
+			serverutil.RecoveryHTTPMiddleware,
+			t.httpAuthMiddleware,
+			serverutil.NewPrepopulateMiddleware(),
 		)
 	}
+	t.server.HTTP.Handle("/loki/api/v1/query_range", httpMiddleware.Wrap(http.HandlerFunc(t.querier.RangeQueryHandler)))
+	t.server.HTTP.Handle("/loki/api/v1/query", httpMiddleware.Wrap(http.HandlerFunc(t.querier.InstantQueryHandler)))
+	// Prometheus compatibility requires `loki/api/v1/labels` however we already released `loki/api/v1/label`
+	// which is a little more consistent with `/loki/api/v1/label/{name}/values` so we are going to handle both paths.
+	t.server.HTTP.Handle("/loki/api/v1/label", httpMiddleware.Wrap(http.HandlerFunc(t.querier.LabelHandler)))
+	t.server.HTTP.Handle("/loki/api/v1/labels", httpMiddleware.Wrap(http.HandlerFunc(t.querier.LabelHandler)))
+	t.server.HTTP.Handle("/loki/api/v1/label/{name}/values", httpMiddleware.Wrap(http.HandlerFunc(t.querier.LabelHandler)))
+	t.server.HTTP.Handle("/loki/api/v1/tail", httpMiddleware.Wrap(http.HandlerFunc(t.querier.TailHandler)))
+	t.server.HTTP.Handle("/loki/api/v1/series", httpMiddleware.Wrap(http.HandlerFunc(t.querier.SeriesHandler)))
 
 	logger := log.With(util_log.Logger, "component", "querier")
 	t.querierAPI = querier.NewQuerierAPI(t.Cfg.Querier, t.Querier, t.Overrides, logger)
@@ -706,107 +703,19 @@ func (t *Loki) initQueryFrontendTripperware() (_ services.Service, err error) {
 	t.stopper = stopper
 	t.QueryFrontEndTripperware = tripperware
 
-	return services.NewIdleService(nil, nil), nil
-}
+	var frontendMiddleware middleware.Interface
 
-func (t *Loki) initCacheGenerationLoader() (_ services.Service, err error) {
-	var client generationnumber.CacheGenClient
-	if t.supportIndexDeleteRequest() {
-		compactorAddress, isGRPCAddress, err := t.compactorAddress()
-		if err != nil {
-			return nil, err
-		}
-
-		reg := prometheus.WrapRegistererWith(prometheus.Labels{"for": "cache_gen", "client_type": t.Cfg.Target.String()}, prometheus.DefaultRegisterer)
-		if isGRPCAddress {
-			client, err = compactor_client.NewGRPCClient(compactorAddress, t.Cfg.CompactorGRPCClient, reg)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			client, err = compactor_client.NewHTTPClient(compactorAddress, t.Cfg.CompactorHTTPClient)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	t.cacheGenerationLoader = generationnumber.NewGenNumberLoader(client, prometheus.DefaultRegisterer)
-	return services.NewIdleService(nil, func(failureCase error) error {
-		t.cacheGenerationLoader.Stop()
-		return nil
-	}), nil
-}
-
-func (t *Loki) supportIndexDeleteRequest() bool {
-	return config.UsingObjectStorageIndex(t.Cfg.SchemaConfig.Configs)
-}
-
-// compactorAddress returns the configured address of the compactor.
-// It prefers grpc address over http. If the address is grpc then the bool would be true otherwise false
-func (t *Loki) compactorAddress() (string, bool, error) {
-	legacyReadMode := t.Cfg.LegacyReadTarget && t.Cfg.isModuleEnabled(Read)
-	if t.Cfg.isModuleEnabled(All) || legacyReadMode || t.Cfg.isModuleEnabled(Backend) {
-		// In single binary or read modes, this module depends on Server
-		return fmt.Sprintf("%s:%d", t.Cfg.Server.GRPCListenAddress, t.Cfg.Server.GRPCListenPort), true, nil
-	}
-
-	if t.Cfg.Common.CompactorAddress == "" && t.Cfg.Common.CompactorGRPCAddress == "" {
-		return "", false, errors.New("query filtering for deletes requires 'compactor_grpc_address' or 'compactor_address' to be configured")
-	}
-
-	if t.Cfg.Common.CompactorGRPCAddress != "" {
-		return t.Cfg.Common.CompactorGRPCAddress, true, nil
-	}
-
-	return t.Cfg.Common.CompactorAddress, false, nil
-}
-
-func (t *Loki) initQueryFrontend() (_ services.Service, err error) {
-	level.Debug(util_log.Logger).Log("msg", "initializing query frontend", "config", fmt.Sprintf("%+v", t.Cfg.Frontend))
-
-	combinedCfg := frontend.CombinedFrontendConfig{
-		Handler:       t.Cfg.Frontend.Handler,
-		FrontendV1:    t.Cfg.Frontend.FrontendV1,
-		FrontendV2:    t.Cfg.Frontend.FrontendV2,
-		DownstreamURL: t.Cfg.Frontend.DownstreamURL,
-	}
-	roundTripper, frontendV1, frontendV2, err := frontend.InitFrontend(
-		combinedCfg,
-		scheduler.SafeReadRing(t.queryScheduler),
-		disabledShuffleShardingLimits{},
-		t.Cfg.Server.GRPCListenPort,
-		util_log.Logger,
-		prometheus.DefaultRegisterer)
-	if err != nil {
-		return nil, err
-	}
-
-	if frontendV1 != nil {
-		frontendv1pb.RegisterFrontendServer(t.Server.GRPC, frontendV1)
-		t.frontend = frontendV1
-		level.Debug(util_log.Logger).Log("msg", "using query frontend", "version", "v1")
-	} else if frontendV2 != nil {
-		frontendv2pb.RegisterFrontendForQuerierServer(t.Server.GRPC, frontendV2)
-		t.frontend = frontendV2
-		level.Debug(util_log.Logger).Log("msg", "using query frontend", "version", "v2")
+	if t.cfg.MultiTenancy.Enabled && t.cfg.MultiTenancy.Type == "label" {
+		frontendMiddleware = t.httpAuthMiddlewareQuery
 	} else {
-		level.Debug(util_log.Logger).Log("msg", "no query frontend configured")
+		frontendMiddleware = t.httpAuthMiddleware
 	}
 
-	roundTripper = t.QueryFrontEndTripperware(roundTripper)
-
-	frontendHandler := transport.NewHandler(t.Cfg.Frontend.Handler, roundTripper, util_log.Logger, prometheus.DefaultRegisterer)
-	if t.Cfg.Frontend.CompressResponses {
-		frontendHandler = gziphandler.GzipHandler(frontendHandler)
-	}
-
-	toMerge := []middleware.Interface{
-		httpreq.ExtractQueryTagsMiddleware(),
-		httpreq.PropagateHeadersMiddleware(httpreq.LokiActorPathHeader),
+	frontendHandler := middleware.Merge(
 		serverutil.RecoveryHTTPMiddleware,
 		t.HTTPAuthMiddleware,
 		queryrange.StatsHTTPMiddleware,
+		frontendMiddleware,
 		serverutil.NewPrepopulateMiddleware(),
 		serverutil.ResponseJSONMiddleware(),
 	}
@@ -851,6 +760,20 @@ func (t *Loki) initQueryFrontend() (_ services.Service, err error) {
 	} else {
 		defaultHandler = frontendHandler
 	}
+	t.server.HTTP.Handle("/loki/api/v1/query_range", frontendHandler)
+	t.server.HTTP.Handle("/loki/api/v1/query", frontendHandler)
+	t.server.HTTP.Handle("/loki/api/v1/label", frontendHandler)
+	t.server.HTTP.Handle("/loki/api/v1/labels", frontendHandler)
+	t.server.HTTP.Handle("/loki/api/v1/label/{name}/values", frontendHandler)
+	t.server.HTTP.Handle("/loki/api/v1/series", frontendHandler)
+	t.server.HTTP.Handle("/api/prom/query", frontendHandler)
+	t.server.HTTP.Handle("/api/prom/label", frontendHandler)
+	t.server.HTTP.Handle("/api/prom/label/{name}/values", frontendHandler)
+	t.server.HTTP.Handle("/api/prom/series", frontendHandler)
+
+	// defer tail endpoints to the default handler
+	t.server.HTTP.Handle("/loki/api/v1/tail", defaultHandler)
+	t.server.HTTP.Handle("/api/prom/tail", defaultHandler)
 	t.Server.HTTP.Path("/loki/api/v1/query_range").Methods("GET", "POST").Handler(frontendHandler)
 	t.Server.HTTP.Path("/loki/api/v1/query").Methods("GET", "POST").Handler(frontendHandler)
 	t.Server.HTTP.Path("/loki/api/v1/label").Methods("GET", "POST").Handler(frontendHandler)
@@ -1051,7 +974,7 @@ func (t *Loki) initMemberlistKV() (services.Service, error) {
 	)
 	dnsProvider := dns.NewProvider(util_log.Logger, dnsProviderReg, dns.GolangResolverType)
 
-	t.MemberlistKV = memberlist.NewKVInitService(&t.Cfg.MemberlistKV, util_log.Logger, dnsProvider, reg)
+	t.MemberlistKV = memberlist.NewKVInitService(&t.Cfg.MemberlistKV, util.Logger, util_log.Logger, dnsProvider, reg)
 
 	t.Cfg.CompactorConfig.CompactorRing.KVStore.MemberlistKV = t.MemberlistKV.GetMemberlistKV
 	t.Cfg.Distributor.DistributorRing.KVStore.MemberlistKV = t.MemberlistKV.GetMemberlistKV

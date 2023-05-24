@@ -10,6 +10,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/grafana/loki/pkg/multitenancy"
+
+	cortex_distributor "github.com/cortexproject/cortex/pkg/distributor"
+	"github.com/cortexproject/cortex/pkg/ring"
+	ring_client "github.com/cortexproject/cortex/pkg/ring/client"
+	cortex_util "github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/limiter"
+	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/pkg/errors"
+	"go.uber.org/atomic"
 	"github.com/grafana/loki/pkg/ingester"
 
 	"github.com/go-kit/log"
@@ -271,40 +281,36 @@ type pushTracker struct {
 // Push a set of streams.
 // The returned error is the last one seen.
 func (d *Distributor) Push(ctx context.Context, req *logproto.PushRequest) (*logproto.PushResponse, error) {
-	tenantID, err := tenant.TenantID(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	// Return early if request does not contain any streams
-	if len(req.Streams) == 0 {
-		return &logproto.PushResponse{}, nil
-	}
-
 	// First we flatten out the request into a list of samples.
 	// We use the heuristic of 1 sample per TS to size the array.
 	// We also work out the hash value at the same time.
-	streams := make([]streamTracker, 0, len(req.Streams))
-	keys := make([]uint32, 0, len(req.Streams))
-	validatedLineSize := 0
-	validatedLineCount := 0
-
+	streams := make(map[string][]streamTracker)
+	keys := make(map[string][]uint32)
 	var validationErr error
-	validationContext := d.validator.getValidationContextForTime(time.Now(), tenantID)
+	validatedSamplesSize := make(map[string]int)
+	validatedSamplesCount := make(map[string]int)
+	streamCounter := 0
 
-	func() {
-		sp := opentracing.SpanFromContext(ctx)
-		if sp != nil {
-			sp.LogKV("event", "start to validate request")
-			defer func() {
-				sp.LogKV("event", "finished to validate request")
-			}()
+	for _, stream := range req.Streams {
+		userID, err := multitenancy.GetUserIDFromContextAndStringLabels(ctx, stream.Labels)
+		if err != nil {
+			return nil, err
 		}
-		for _, stream := range req.Streams {
-			// Return early if stream does not contain any entries
-			if len(stream.Entries) == 0 {
-				continue
-			}
+
+		// Track metrics moved to inside
+		bytesCount := 0
+		lineCount := 0
+		for _, entry := range stream.Entries {
+			bytesCount += len(entry.Line)
+			lineCount++
+		}
+		bytesIngested.WithLabelValues(userID).Add(float64(bytesCount))
+		linesIngested.WithLabelValues(userID).Add(float64(lineCount))
+
+		if err := d.validator.ValidateLabels(userID, stream); err != nil {
+			validationErr = err
+			continue
+		}
 
 			// Truncate first so subsequent steps have consistent line lengths
 			d.truncateLines(validationContext, &stream)
@@ -320,28 +326,21 @@ func (d *Distributor) Push(ctx context.Context, req *logproto.PushRequest) (*log
 				validation.DiscardedBytes.WithLabelValues(validation.InvalidLabels, tenantID).Add(float64(bytes))
 				continue
 			}
+			entries = append(entries, entry)
+			validatedSamplesSize[userID] += len(entry.Line)
+			validatedSamplesCount[userID]++
+		}
 
-			n := 0
-			pushSize := 0
-			for _, entry := range stream.Entries {
-				if err := d.validator.ValidateEntry(validationContext, stream.Labels, entry); err != nil {
-					validationErr = err
-					continue
-				}
-
-				stream.Entries[n] = entry
-
-				// If configured for this tenant, increment duplicate timestamps. Note, this is imperfect
-				// since Loki will accept out of order writes it doesn't account for separate
-				// pushes with overlapping time ranges having entries with duplicate timestamps
-				if validationContext.incrementDuplicateTimestamps && n != 0 {
-					// Traditional logic for Loki is that 2 lines with the same timestamp and
-					// exact same content will be de-duplicated, (i.e. only one will be stored, others dropped)
-					// To maintain this behavior, only increment the timestamp if the log content is different
-					if stream.Entries[n-1].Line != entry.Line {
-						stream.Entries[n].Timestamp = maxT(entry.Timestamp, stream.Entries[n-1].Timestamp.Add(1*time.Nanosecond))
-					}
-				}
+		if len(entries) == 0 {
+			continue
+		}
+		stream.Entries = entries
+		keys[userID] = append(keys[userID], util.TokenFor(userID, stream.Labels))
+		streams[userID] = append(streams[userID], streamTracker{
+			stream: stream,
+		})
+		streamCounter++
+	}
 
 				n++
 				validatedLineSize += len(entry.Line)
@@ -368,11 +367,13 @@ func (d *Distributor) Push(ctx context.Context, req *logproto.PushRequest) (*log
 	}
 
 	now := time.Now()
-	if !d.ingestionRateLimiter.AllowN(now, tenantID, validatedLineSize) {
-		// Return a 429 to indicate to the client they are being rate limited
-		validation.DiscardedSamples.WithLabelValues(validation.RateLimited, tenantID).Add(float64(validatedLineCount))
-		validation.DiscardedBytes.WithLabelValues(validation.RateLimited, tenantID).Add(float64(validatedLineSize))
-		return nil, httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, tenantID, int(d.ingestionRateLimiter.Limit(now, tenantID)), validatedLineCount, validatedLineSize)
+	for k := range validatedSamplesSize {
+		if !d.ingestionRateLimiter.AllowN(now, k, validatedSamplesSize[k]) {
+			// Return a 429 to indicate to the client they are being rate limited
+			validation.DiscardedSamples.WithLabelValues(validation.RateLimited, k).Add(float64(validatedSamplesCount[k]))
+			validation.DiscardedBytes.WithLabelValues(validation.RateLimited, k).Add(float64(validatedSamplesSize[k]))
+			return nil, httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg(int(d.ingestionRateLimiter.Limit(now, k)), validatedSamplesCount[k], validatedSamplesSize[k]))
+		}
 	}
 
 	const maxExpectedReplicationSet = 5 // typical replication factor 3 plus one for inactive plus one for luck
@@ -390,40 +391,45 @@ func (d *Distributor) Push(ctx context.Context, req *logproto.PushRequest) (*log
 			}()
 		}
 
-		for i, key := range keys {
-			replicationSet, err := d.ingestersRing.Get(key, ring.WriteNoExtend, descs[:0], nil, nil)
+	samplesByIngester := make(map[string]map[string][]*streamTracker)
+	ingesterDescs := make(map[string]ring.IngesterDesc)
+	for uID, keyArr := range keys {
+		for i, key := range keyArr {
+			replicationSet, err := d.ingestersRing.Get(key, ring.Write, descs[:0])
 			if err != nil {
-				return err
+				return nil, err
 			}
 
-			streams[i].minSuccess = len(replicationSet.Instances) - replicationSet.MaxErrors
-			streams[i].maxFailures = replicationSet.MaxErrors
-			for _, ingester := range replicationSet.Instances {
-				streamsByIngester[ingester.Addr] = append(streamsByIngester[ingester.Addr], &streams[i])
+			streams[uID][i].minSuccess = len(replicationSet.Ingesters) - replicationSet.MaxErrors
+			streams[uID][i].maxFailures = replicationSet.MaxErrors
+			for _, ingester := range replicationSet.Ingesters {
+				if samplesByIngester[ingester.Addr] == nil {
+					samplesByIngester[ingester.Addr] = make(map[string][]*streamTracker)
+				}
+				samplesByIngester[ingester.Addr][uID] = append(samplesByIngester[ingester.Addr][uID], &streams[uID][i])
 				ingesterDescs[ingester.Addr] = ingester
 			}
 		}
-		return nil
-	}(); err != nil {
-		return nil, err
 	}
 
 	tracker := pushTracker{
-		done: make(chan struct{}, 1), // buffer avoids blocking if caller terminates - sendSamples() only sends once on each
-		err:  make(chan error, 1),
+		done: make(chan struct{}),
+		err:  make(chan error),
 	}
-	tracker.streamsPending.Store(int32(len(streams)))
-	for ingester, streams := range streamsByIngester {
-		go func(ingester ring.InstanceDesc, samples []*streamTracker) {
-			// Use a background context to make sure all ingesters get samples even if we return early
-			localCtx, cancel := context.WithTimeout(context.Background(), d.clientCfg.RemoteTimeout)
-			defer cancel()
-			localCtx = user.InjectOrgID(localCtx, tenantID)
-			if sp := opentracing.SpanFromContext(ctx); sp != nil {
-				localCtx = opentracing.ContextWithSpan(localCtx, sp)
+	tracker.samplesPending.Store(int32(streamCounter))
+	for ingester, samples := range samplesByIngester {
+		go func(ingester ring.IngesterDesc, samples map[string][]*streamTracker) {
+			for uID, streams := range samples {
+				// Use a background context to make sure all ingesters get samples even if we return early
+				localCtx, cancel := context.WithTimeout(context.Background(), d.clientCfg.RemoteTimeout)
+				defer cancel()
+				localCtx = user.InjectOrgID(localCtx, uID)
+				if sp := opentracing.SpanFromContext(ctx); sp != nil {
+					localCtx = opentracing.ContextWithSpan(localCtx, sp)
+				}
+				d.sendSamples(localCtx, ingester, streams, &tracker)
 			}
-			d.sendStreams(localCtx, ingester, samples, &tracker)
-		}(ingesterDescs[ingester], streams)
+		}(ingesterDescs[ingester], samples)
 	}
 	select {
 	case err := <-tracker.err:

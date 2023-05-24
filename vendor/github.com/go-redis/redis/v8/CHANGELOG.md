@@ -85,6 +85,11 @@ err := rdb.MGet(ctx, "key1", "key2").Scan(&data)
   [monkey92t](https://github.com/monkey92t) if you are looking for mocking Redis Client.
 
 ## v8
+# Changelog
+
+> :heart: [**Uptrace.dev** - distributed traces, logs, and errors in one place](https://uptrace.dev)
+
+## v8 (unreleased)
 
 - All commands require `context.Context` as a first argument, e.g. `rdb.Ping(ctx)`. If you are not
   using `context.Context` yet, the simplest option is to define global package variable
@@ -93,6 +98,7 @@ err := rdb.MGet(ctx, "key1", "key2").Scan(&data)
 - Full support for `context.Context` canceling.
 
 - Added `redis.NewFailoverClusterClient` that supports routing read-only commands to a slave node.
+- `Cluster.ForEachNode` is renamed to `ForEachShard` for consistency with `Ring`.
 
 - Added `redisext.OpenTemetryHook` that adds
   [Redis OpenTelemetry instrumentation](https://redis.uptrace.dev/tracing/).

@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"go.uber.org/atomic"
+	multitenancy "github.com/grafana/loki/pkg/multitenancy"
+	"github.com/grafana/loki/pkg/storage/stores/shipper/compactor"
 
 	"github.com/fatih/color"
 	"github.com/felixge/fgprof"
@@ -65,6 +67,8 @@ import (
 
 // Config is the root config for Loki.
 type Config struct {
+	Target     string `yaml:"target,omitempty"`
+	HTTPPrefix string `yaml:"http_prefix"`
 	Target       flagext.StringSliceCSV `yaml:"target,omitempty"`
 	AuthEnabled  bool                   `yaml:"auth_enabled,omitempty"`
 	HTTPPrefix   string                 `yaml:"http_prefix" doc:"hidden"`
@@ -106,6 +110,7 @@ type Config struct {
 	Common common.Config `yaml:"common,omitempty"`
 
 	ShutdownDelay time.Duration `yaml:"shutdown_delay" category:"experimental"`
+	MultiTenancy     multitenancy.Config         `yaml:"multi_tenancy,omitempty"`
 }
 
 // RegisterFlags registers flag.
@@ -113,34 +118,7 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	c.Server.MetricsNamespace = "loki"
 	c.Server.ExcludeRequestInLog = true
 
-	// Set the default module list to 'all'
-	c.Target = []string{All}
-	f.Var(&c.Target, "target",
-		"A comma-separated list of components to run. "+
-			"The default value 'all' runs Loki in single binary mode. "+
-			"The value 'read' is an alias to run only read-path related components such as the querier and query-frontend, but all in the same process. "+
-			"The value 'write' is an alias to run only write-path related components such as the distributor and compactor, but all in the same process. "+
-			"Supported values: all, compactor, distributor, ingester, querier, query-scheduler, ingester-querier, query-frontend, index-gateway, ruler, table-manager, read, write. "+
-			"A full list of available targets can be printed when running Loki with the '-list-targets' command line flag. ",
-	)
-	f.BoolVar(&c.AuthEnabled, "auth.enabled", true,
-		"Enables authentication through the X-Scope-OrgID header, which must be present if true. "+
-			"If false, the OrgID will always be set to 'fake'.",
-	)
-	f.IntVar(&c.BallastBytes, "config.ballast-bytes", 0,
-		"The amount of virtual memory in bytes to reserve as ballast in order to optimize garbage collection. "+
-			"Larger ballasts result in fewer garbage collection passes, reducing CPU overhead at the cost of heap size. "+
-			"The ballast will not consume physical memory, because it is never read from. "+
-			"It will, however, distort metrics, because it is counted as live memory. ",
-	)
-	f.BoolVar(&c.UseBufferedLogger, "log.use-buffered", true, "Uses a line-buffered logger to improve performance.")
-	f.BoolVar(&c.UseSyncLogger, "log.use-sync", true, "Forces all lines logged to hold a mutex to serialize writes.")
-
-	//TODO(trevorwhitney): flip this to false with Loki 3.0
-	f.BoolVar(&c.LegacyReadTarget, "legacy-read-mode", true, "Set to false to disable the legacy read mode and use new scalable mode with 3rd backend target. "+
-		"The default will be flipped to false in the next Loki release.")
-
-	f.DurationVar(&c.ShutdownDelay, "shutdown-delay", 0, "How long to wait between SIGTERM and shutdown. After receiving SIGTERM, Loki will report 503 Service Unavailable status via /ready endpoint.")
+	f.StringVar(&c.Target, "target", All, "target module (default All)")
 
 	c.registerServerFlagsWithChangedDefaultValues(f)
 	c.Common.RegisterFlags(f)
@@ -193,6 +171,7 @@ func (c *Config) registerServerFlagsWithChangedDefaultValues(fs *flag.FlagSet) {
 	})
 
 	c.Server.DisableRequestSuccessLog = true
+	c.MultiTenancy.RegisterFlags(f)
 }
 
 // Clone takes advantage of pass-by-value semantics to return a distinct *Config.
@@ -320,6 +299,9 @@ func AdjustForTimeoutsMigration(c *Config) error {
 		return nil
 	}
 
+	if err := c.MultiTenancy.Validate(); err != nil {
+		return errors.Wrap(err, "invalid multi-tenancy config")
+	}
 	return nil
 }
 
@@ -373,7 +355,8 @@ type Loki struct {
 	clientMetrics       storage.ClientMetrics
 	deleteClientMetrics *deletion.DeleteRequestClientMetrics
 
-	HTTPAuthMiddleware middleware.Interface
+	HTTPAuthMiddleware      middleware.Interface
+	httpAuthMiddlewareQuery middleware.Interface
 }
 
 // New makes a new Loki.
@@ -394,6 +377,26 @@ func New(cfg Config) (*Loki, error) {
 }
 
 func (t *Loki) setupAuthMiddleware() {
+	t.cfg.Server.GRPCMiddleware = []grpc.UnaryServerInterceptor{serverutil.RecoveryGRPCUnaryInterceptor}
+	t.cfg.Server.GRPCStreamMiddleware = []grpc.StreamServerInterceptor{serverutil.RecoveryGRPCStreamInterceptor}
+	if t.cfg.MultiTenancy.Enabled && t.cfg.MultiTenancy.Type == "auth" {
+		t.cfg.Server.GRPCMiddleware = append(t.cfg.Server.GRPCMiddleware, middleware.ServerUserHeaderInterceptor)
+		t.cfg.Server.GRPCStreamMiddleware = append(t.cfg.Server.GRPCStreamMiddleware, GRPCStreamAuthInterceptor)
+		t.httpAuthMiddleware = middleware.AuthenticateUser
+	} else if t.cfg.MultiTenancy.Enabled && t.cfg.MultiTenancy.Type == "label" {
+		t.cfg.Server.GRPCMiddleware = append(t.cfg.Server.GRPCMiddleware, middleware.ServerUserHeaderInterceptor)
+		t.cfg.Server.GRPCStreamMiddleware = append(t.cfg.Server.GRPCStreamMiddleware, GRPCStreamAuthInterceptor)
+		t.httpAuthMiddleware = multitenancy.HTTPAuthMiddlewarePush(t.cfg.MultiTenancy.Label, t.cfg.MultiTenancy.Undefined)
+		t.httpAuthMiddlewareQuery = middleware.AuthenticateUser
+	} else {
+		t.cfg.Server.GRPCMiddleware = append(t.cfg.Server.GRPCMiddleware, fakeGRPCAuthUnaryMiddleware)
+		t.cfg.Server.GRPCStreamMiddleware = append(t.cfg.Server.GRPCStreamMiddleware, fakeGRPCAuthStreamMiddleware)
+		t.httpAuthMiddleware = fakeHTTPAuthMiddleware
+	}
+}
+
+var GRPCStreamAuthInterceptor = func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	switch info.FullMethod {
 	// Don't check auth header on TransferChunks, as we weren't originally
 	// sending it and this could cause transfers to fail on update.
 	t.HTTPAuthMiddleware = fakeauth.SetupAuthMiddleware(&t.Cfg.Server, t.Cfg.AuthEnabled,

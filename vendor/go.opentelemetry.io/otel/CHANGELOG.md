@@ -1537,6 +1537,11 @@ with major version 0.
 - A dimensionality-reducing metric Processor. (#1057)
 - Integration tests for more OTel Collector Attribute types. (#1062)
 - A new `WithSpanProcessor` `ProviderOption` is added to the `go.opentelemetry.io/otel/sdk/trace` package to create a `Provider` and automatically register the `SpanProcessor`. (#1078)
+- `Noop` and `InMemory` `SpanBatcher` implementations to help with testing integrations. (#994)
+- Integration tests for more OTel Collector Attribute types. (#1062)
+- A dimensionality-reducing metric Processor. (#1057)
+- Support for filtering metric label sets. (#1047)
+- Support for exporting array-valued attributes via OTLP. (#992)
 
 ### Changed
 
@@ -1836,6 +1841,7 @@ This release implements the v0.5.0 version of the OpenTelemetry specification.
 - The push controller now has a method (`Provider()`) to return a `metric.Provider` instead of the old `Meter` method that acted as a `metric.Provider`. (#738)
 - Replace `Measure` instrument by `ValueRecorder` instrument. (#732)
 - Rename correlation context header from `"Correlation-Context"` to `"otcorrelations"` to match the OpenTelemetry specification. (#727)
+- Rename correlation context header from `"Correlation-Context"` to `"otcorrelations"` to match the OpenTelemetry specification. 727)
 
 ### Fixed
 
@@ -1938,6 +1944,7 @@ This release implements the v0.5.0 version of the OpenTelemetry specification.
 - Create a new recorder rather than reuse when multiple observations in same epoch for asynchronous instruments. #610
 - The default port the OTLP exporter uses to connect to the OpenTelemetry collector is updated to match the one the collector listens on by default. (#611)
 
+
 ## [0.4.2] - 2020-03-31
 
 ### Fixed
@@ -1998,6 +2005,7 @@ There is still a possibility of breaking changes.
 - The zipkin trace exporter. (#495)
 - The OTLP exporter to export metric and trace telemetry to the OpenTelemetry collector. (#497) (#544) (#545)
 - Add `StatusMessage` field to the trace `Span`. (#524)
+- The `StatusMessage` field was add to the trace `Span`. (#524)
 - Context propagation in OpenTracing bridge in terms of OpenTelemetry context propagation. (#525)
 - The `Resource` type was added to the SDK. (#528)
 - The global API now supports a `Tracer` and `Meter` function as shortcuts to getting a global `*Provider` and calling these methods directly. (#538)
@@ -2090,12 +2098,14 @@ There is still a possibility of breaking changes.
 - `AlwaysParentSample` sampler to the trace API. (#455)
 - `WithNewRoot` option function to the trace API to specify the created span should be considered a root span. (#451)
 
+
 ### Changed
 
 - Renamed `WithMap` to `ContextWithMap` in the correlation package. (#481)
 - Renamed `FromContext` to `MapFromContext` in the correlation package. (#481)
 - Move correlation context propagation to correlation package. (#479)
 - Do not default to putting remote span context into links. (#480)
+- Propagators extrac
 - `Tracer.WithSpan` updated to accept `StartOptions`. (#472)
 - Renamed `MetricKind` to `Kind` to not stutter in the type usage. (#432)
 - Renamed the `export` package to `metric` to match directory structure. (#432)
@@ -2243,6 +2253,7 @@ There is still a possibility of breaking changes.
    This allowed distinct label sets through, but any metrics sharing a label set could be overwritten or merged incorrectly.
    This was corrected. (#333)
 
+
 ## [0.1.2] - 2019-11-18
 
 ### Fixed
@@ -2343,6 +2354,8 @@ It contains api and sdk for trace and meter.
 [0.14.0]: https://github.com/open-telemetry/opentelemetry-go/releases/tag/v0.14.0
 [0.13.0]: https://github.com/open-telemetry/opentelemetry-go/releases/tag/v0.13.0
 [0.12.0]: https://github.com/open-telemetry/opentelemetry-go/releases/tag/v0.12.0
+
+[Unreleased]: https://github.com/open-telemetry/opentelemetry-go/compare/v0.11.0...HEAD
 [0.11.0]: https://github.com/open-telemetry/opentelemetry-go/releases/tag/v0.11.0
 [0.10.0]: https://github.com/open-telemetry/opentelemetry-go/releases/tag/v0.10.0
 [0.9.0]: https://github.com/open-telemetry/opentelemetry-go/releases/tag/v0.9.0

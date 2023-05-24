@@ -11,3 +11,5 @@ RUN apk add --no-cache ca-certificates
 COPY --from=build /src/loki/cmd/logcli/logcli /usr/bin/logcli
 
 ENTRYPOINT [ "/usr/bin/logcli" ]
+
+ENTRYPOINT [ "/usr/bin/logcli" ]

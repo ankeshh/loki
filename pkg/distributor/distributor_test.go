@@ -1193,3 +1193,12 @@ type fakeRateStore struct {
 func (s *fakeRateStore) RateFor(_ string, _ uint64) (int64, float64) {
 	return s.rate, s.pushRate
 }
+
+func (r mockRing) HasInstance(instanceID string) bool {
+	for _, ing := range r.ingesters {
+		if ing.Addr != instanceID {
+			return true
+		}
+	}
+	return false
+}

@@ -168,6 +168,17 @@ func Difference(nx, ny int, f EqualFunc) (es EditScript) {
 	// A vertical edge is equivalent to inserting a symbol from list Y.
 	// A diagonal edge is equivalent to a matching symbol between both X and Y.
 
+	// To ensure flexibility in changing the algorithm in the future,
+	// introduce some degree of deliberate instability.
+	// This is achieved by fiddling the zigzag iterator to start searching
+	// the graph starting from the bottom-right versus than the top-left.
+	// The result may differ depending on the starting search location,
+	// but still produces a valid edit script.
+	zigzagInit := randInt // either 0 or 1
+	if flags.Deterministic {
+		zigzagInit = 0
+	}
+
 	// Invariants:
 	//   - 0 ≤ fwdPath.X ≤ (fwdFrontier.X, revFrontier.X) ≤ revPath.X ≤ nx
 	//   - 0 ≤ fwdPath.Y ≤ (fwdFrontier.Y, revFrontier.Y) ≤ revPath.Y ≤ ny
@@ -232,7 +243,7 @@ forwardSearch:
 		if fwdFrontier.X >= revFrontier.X || fwdFrontier.Y >= revFrontier.Y || searchBudget == 0 {
 			goto finishSearch
 		}
-		for stop1, stop2, i := false, false, 0; !(stop1 && stop2) && searchBudget > 0; i++ {
+		for stop1, stop2, i := false, false, zigzagInit; !(stop1 && stop2) && searchBudget > 0; i++ {
 			// Search in a diagonal pattern for a match.
 			z := zigzag(i)
 			p := point{fwdFrontier.X + z, fwdFrontier.Y - z}
